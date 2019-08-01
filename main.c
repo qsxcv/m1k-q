@@ -80,30 +80,21 @@ static inline uint8_t spi_read(const uint8_t addr)
 
 static void pmw3360_init(const uint8_t dpi)
 {
-	const uint8_t *psrom = srom;
-
+	// drop and raise ncs to reset spi port (power-up step 2)
 	SS_HIGH;
-	delay_ms(3);
-
-	// shutdown first
-	SS_LOW;
-	spi_write(0x3b, 0xb6);
-	SS_HIGH;
-	delay_ms(300);
-
-	// drop and raise ncs to reset spi port
+	delay_us(40);
 	SS_LOW;
 	delay_us(40);
 	SS_HIGH;
 	delay_us(40);
 
-	// power up reset
+	// power up reset  (power-up step 3, 4)
 	SS_LOW;
 	spi_write(0x3a, 0x5a);
 	SS_HIGH;
 	delay_ms(50);
 
-	// read from 0x02 to 0x06
+	// read from 0x02 to 0x06 (power-up step 5)
 	SS_LOW;
 	spi_read(0x02);
 	spi_read(0x03);
@@ -111,17 +102,16 @@ static void pmw3360_init(const uint8_t dpi)
 	spi_read(0x05);
 	spi_read(0x06);
 
-	spi_write(0x10, 0x00); // well i know this disables rest mode. not sure purpose
-	spi_write(0x22, 0x00); // ???
-
-	// srom download
-	spi_write(0x13, 0x1d);
+	// srom download (power-up step 6)
+	spi_write(0x10, 0x00); // (srom step 2)
+	spi_write(0x13, 0x1d); // (srom step 3)
 	SS_HIGH;
-	delay_ms(10);
+	delay_ms(10); // (srom step 4)
 	SS_LOW;
-	spi_write(0x13, 0x18);
+	spi_write(0x13, 0x18); // (srom step 5)
 
-	spi_send(0x62 | 0x80);
+	spi_send(0x62 | 0x80); // (srom step 6)
+	const uint8_t *psrom = srom;
 	for (uint16_t i = 0; i < SROM_LENGTH; i++) {
 		delay_us(16);
 		spi_send(pgm_read_byte(psrom++));
@@ -132,80 +122,50 @@ static void pmw3360_init(const uint8_t dpi)
 
 	// configuration/settings
 	SS_LOW;
-	spi_write(0x10, 0x00); // 0x20 (g502 default) enables rest mode after ~10s of inactivity
-	spi_write(0x14, 0xff); // how long to wait before going to rest mode. 0xff is max (~10 seconds)
-	spi_write(0x17, 0xff); // ???
-	spi_write(0x18, 0x00); // ???
-	spi_write(0x19, 0x00); // ???
-	spi_write(0x1b, 0x00); // ???
-	spi_write(0x1c, 0x00); // ???
-
-	// surface tuning settings (default: 0x0a, 0x10)
-	// probably not necessary to read them first.
-//	spi_read(0x2c);
-//	spi_read(0x2b);
-//	delay_us(18);
-//	spi_write(0x2c, 0x0a);
-//	spi_write(0x2b, 0x10);
-
-	// configuration/settings
-	spi_write(0x0f, dpi);
+	spi_write(0x10, 0x00); // no rest mode
 	spi_write(0x42, 0x00); // no angle snapping
+	spi_write(0x0f, dpi);
 	//spi_write(0x63, 0x03); // 3mm lod
-	//spi_write(0x0d, 0x00);
+	//spi_write(0x0d, 0x00); // 0 degree
 	SS_HIGH;
 }
 
 int main(void)
 {
-	union motion_data x, y;
-
 	// set clock prescaler for 8MHz
 	CLKPR = 0x80;
 	CLKPR = 0x01;
 
 	pins_init();
 
-	// previous physical state to compare against for debouncing
+	// previous debounced button state (1 for pressed, 0 for released)
 	uint8_t btn_prev = (~PIND) & 0x03; // read L+R
-	// previous state of btn_usb
-	uint8_t btn_usb_prev = btn_prev;
-	// previously transmitted button state
-	uint8_t btn_usb_prev_trans = btn_prev;
 
 	if (btn_prev == 3) { // jump to bootloader if both L+R held for >=2 seconds
+		const uint8_t max = 100;
 		uint8_t i;
-		for (i = 0; i < 100; i++) {
+		for (i = 0; i < max; i++) {
 			delay_ms(20);
 			if (((~PIND) & 0x03) != 3) break;
 		}
-		if (i == 100) __asm__ volatile ("jmp 0x7000");
+		if (i == max) __asm__ volatile ("jmp 0x7000");
 	}
 
-	const int8_t whl_step = 15;
-	int16_t whl_loc = 0;
-	int8_t dwhl = 0;
-
-	int8_t r_click_mode = 0;
-	uint8_t r_click_timer = 0;
-
+	union motion_data x_sum, y_sum; // total motion after last usb transmission
 	spi_init();
 	// set dpi based on initial state of buttons
 	//	none	left	right	left+right
 	//	800	3500	3600	12000
 	const uint8_t dpi = (uint8_t []){7, 34, 35, 119}[btn_prev];
 	pmw3360_init(dpi); // yay compound literals
-
 	// begin burst mode
 	SS_LOW;
 	spi_write(0x50, 0x00);
 	SS_HIGH;
 
-
 	usb_init();
 	while (!usb_configured());
 	delay_ms(456); // arbitrary
-
 
 	// set up timer0 to set OCF0A in TIFR0 every 125us
 	TCCR0A = 0x02; // CTC
@@ -213,122 +173,98 @@ int main(void)
 	OCR0A = 124; // = 125 - 1
 
 	cli();
-	while (1) {
-		for (uint8_t i = 0; i < 8; i++) {
-		// synchronization to usb frames and 125us intervals
-			// polling interrupt flags gives 5 clock cycles or so of
-			// jitter. possible to eliminate by going into sleep
-			// mode and waking up using interrupts, but whatever.
-			if (i == 0) {
-				// sync to usb frames (1ms)
-				UDINT &= ~(1<<SOFI);
-				while(!(UDINT & (1<<SOFI)));
-				// reset prescaler phase, not really necessary
-				GTCCR |= (1<<PSRSYNC);
-				TCNT0 = 0;
-			} else {
-				// sync to 125us intervals using timer0
-				while (!(TIFR0 & (1<<OCF0A)));
-			}
-			TIFR0 |= (1<<OCF0A); // 0CF0A is cleared by writing 1
+	for (uint8_t i = 0; ; i = (i + 1) % 8) {
+	// synchronization to usb frames and 125us intervals
+		// polling interrupt flags gives 5 clock cycles or so of
+		// jitter. possible to eliminate by going into sleep
+		// mode and waking up using interrupts, but whatever.
+		if (i == 0) {
+			// sync to usb frames (1ms)
+			UDINT &= ~(1<<SOFI);
+			while(!(UDINT & (1<<SOFI)));
+			// reset prescaler phase, not really necessary
+			GTCCR |= (1<<PSRSYNC);
+			TCNT0 = 0;
+		} else {
+			// sync to 125us intervals using timer0
+			while (!(TIFR0 & (1<<OCF0A)));
+		}
+		TIFR0 |= (1<<OCF0A); // 0CF0A is cleared by writing 1
 
-		// sensor stuff
-			union motion_data _x, _y; // inverted
+	// sensor stuff
+		union motion_data x, y;
+		SS_LOW;
+		spi_send(0x50);
+		delay_us(35);
+		spi_send(0x00); // motion, not used
+		spi_send(0x00); // observation, not used
+		x.lo = spi_recv();
+		x.hi = spi_recv();
+		y.lo = spi_recv();
+		y.hi = spi_recv();
+		SS_HIGH;
+
+	// button stuff
+		//high = not pressed, low = pressed
+		//PIND 0 EIFR 0: low, no edges -> is low
+		//PIND 0 EIFR 1: low, edge -> is low
+		//PIND 1 EIFR 0: high, no edges -> always high during last 125us
+		//PIND 1 EIFR 1: high, edge -> low at some point in the last 125us
+		const uint8_t btn_raw = ((~PIND) | EIFR) & 0x0f; // 1 means low
+		EIFR = 0b00001111; // clear EIFR
+		const uint8_t btn_bot = btn_raw & 0x03;
+		const uint8_t btn_top = btn_raw >> 2;
+		// 0 means not in contact, 1 means in contact
+		// bottom 0 top 0: floating, keep previous state
+		// bottom 0 top 1: released
+		// bottom 1 top 0: pressed
+		// bottom 1 top 1: not possible
+		const uint8_t btn_dbncd = btn_bot | (~btn_top & btn_prev);
+
+	// usb
+		// first make sure it's configured
+		sei();
+		if (!usb_configured()) {
+			// if not, shut off sensor and restart everything
+			PORTC &= ~(1<<2);
+			while (!usb_configured());
+			PORTC |= (1<<2);
+			pmw3360_init(dpi);
+			// begin burst mode
 			SS_LOW;
-			spi_send(0x50);
-			delay_us(35);
-			spi_send(0x00); // motion, not used
-			spi_send(0x00); // observation, not used
-			_x.lo = spi_recv();
-			_x.hi = spi_recv();
-			_y.lo = spi_recv();
-			_y.hi = spi_recv();
+			spi_write(0x50, 0x00);
 			SS_HIGH;
+		}
+		cli();
 
-		// button stuff
-			//high = not pressed, low = pressed
-			//PIND 0 EIFR 0: low, no edges -> is low
-			//PIND 0 EIFR 1: low, edge -> is low
-			//PIND 1 EIFR 0: high, no edges -> always high during last 125us
-			//PIND 1 EIFR 1: high, edge -> low at some point in the last 125us
-			const uint8_t btn_raw = ((~PIND) | EIFR) & 0b00001111; // 1 means low
-			EIFR = 0b00001111; // clear EIFR
-
-			const uint8_t btn_bot = btn_raw & 0b00000011;
-			const uint8_t btn_top = btn_raw >> 2;
-			const uint8_t btn_dbncd = btn_bot | (~btn_top & btn_prev);
-
-			// wheel emulation
-			int8_t _dwhl = 0;
-			if (btn_dbncd & (1<<1)) { // R pressed
-				if (!(btn_prev & (1<<1))) // R just pressed
-					r_click_mode = 1;
-				whl_loc += _y.all; // move down to scroll down
-				int8_t sgn = 2*(whl_loc > 0) - 1;
-				while (sgn*whl_loc > whl_step/2) {
-					r_click_mode = 0;
-					whl_loc -= sgn*whl_step;
-					_dwhl += sgn;
-				}
-			} else if (r_click_mode && btn_prev & (1<<1)) { // R just released
-				r_click_timer = 80;
-				whl_loc = 0;
+		// this stuff is very intricate and confusing
+		// i'm fairly certain all of it is correct.
+		// there's nothing to do if nothing's changed in this 125us cycle
+		if ((btn_dbncd != btn_prev) || x.all || y.all) {
+			UENUM = MOUSE_ENDPOINT;
+			if (UESTA0X & (1<<NBUSYBK0)) { // untransmitted data still in bank
+				UEINTX |= (1<<RXOUTI); // kill bank; RXOUTI == KILLBK
+				while (UEINTX & (1<<RXOUTI));
+			} else {
+				// transmission's finished, or the data that should be in the
+				// bank is exactly the same as what was previously transmitted
+				// so that there was nothing worth transmitting before.
+				x_sum.all = 0;
+				y_sum.all = 0;
 			}
-
-			uint8_t btn_usb = btn_dbncd & (1<<0);
-			if (r_click_timer > 0) {
-				r_click_timer--;
-				btn_usb |= (1<<1);
+			x_sum.all -= x.all; // invert here for m1k
+			y_sum.all -= y.all;
+			// only load bank with data if there's something worth transmitting
+			if ((btn_dbncd != btn_prev) || x_sum.all || y_sum.all) {
+				UEDATX = btn_dbncd;
+				UEDATX = x_sum.lo;
+				UEDATX = x_sum.hi;
+				UEDATX = y_sum.lo;
+				UEDATX = y_sum.hi;
+				UEDATX = 0; // wheel scrolls
+				UEINTX = 0x3a;
+				btn_prev = btn_dbncd;
 			}
-
-		// usb
-			// first make sure it's configured
-			sei();
-			if (!usb_configured()) {
-				PORTC &= ~(1<<2);
-				while (!usb_configured());
-				PORTC |= (1<<2);
-				pmw3360_init(dpi);
-				// begin burst mode
-				SS_LOW;
-				spi_write(0x50, 0x00);
-				SS_HIGH;
-			}
-			cli();
-
-			// this stuff is very intricate and confusing
-			// i'm fairly certain all of it is correct.
-			// there's nothing to do if nothing's changed in this 125us cycle
-			if ((btn_usb != btn_usb_prev) || _x.all || _y.all || _dwhl) {
-				UENUM = MOUSE_ENDPOINT;
-				if (UESTA0X & (1<<NBUSYBK0)) { // untransmitted data still in bank
-					UEINTX |= (1<<RXOUTI); // kill bank; RXOUTI == KILLBK
-					while (UEINTX & (1<<RXOUTI));
-				} else {
-					// transmission's finished, or the data that should be in the
-					// bank is exactly the same as what was previously transmitted
-					// so that there was nothing worth transmitting before.
-					x.all = 0;
-					y.all = 0;
-					dwhl = 0;
-				}
-				x.all -= _x.all; // invert here
-				y.all -= _y.all;
-				dwhl += _dwhl;
-				// only load bank with data if there's something worth transmitting
-				if ((btn_usb != btn_usb_prev_trans) || x.all || y.all || dwhl) {
-					UEDATX = btn_usb;
-					UEDATX = x.lo;
-					UEDATX = x.hi;
-					UEDATX = y.lo;
-					UEDATX = y.hi;
-					UEDATX = dwhl; // wheel scrolls
-					UEINTX = 0x3a;
-					btn_usb_prev_trans = btn_usb;
-				}
-			}
-			btn_prev = btn_dbncd;
-			btn_usb_prev = btn_usb;
 		}
 	}
 }
